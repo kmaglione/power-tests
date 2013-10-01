@@ -5,7 +5,7 @@ POWERLOG=${POWERLOG:-"C:/Program Files/Intel/Power Gadget 2.6/PowerLog.exe"}
 
 SKELETON_PROFILE=${SKELETON_PROFILE:-"$(pwd)/profile"}
 
-profile="$(pwd)/test-profile"
+profile="$(pwd)/test-profile-${TEST_ADDON_BASENAME}"
 
 if [ $# = 0 ]
 then

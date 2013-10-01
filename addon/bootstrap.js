@@ -3,10 +3,10 @@ const { classes: Cc, interfaces: Ci, utils: Cu, results: Cr } = Components;
 
 const TEST_URL = "http://enwp.org/Gustav_Mahler";
 
-const FIRST_RUN_QUIT_TIMEOUT = 1000;
-const QUIT_TIMEOUT = 30 * 1000;
-const START_TIMEOUT = 30 * 1000;
-const TEST_TIMEOUT = 10 * 1000;
+var FIRST_RUN_QUIT_TIMEOUT = 1000;
+var START_TIMEOUT = 5 * 1000;
+var QUIT_TIMEOUT = 10 * 1000;
+var TEST_TIMEOUT = 10 * 1000;
 
 const TEST_URLS = [
     "http://ruby-doc.org/stdlib-2.0.0/",
@@ -17,12 +17,15 @@ const TEST_URLS = [
     "http://slashdot.org/",
 ];
 
+Cu.import("resource://gre/modules/ctypes.jsm");
 Cu.import("resource://gre/modules/Services.jsm");
 const { TextEncoder } = Cu.import("resource://gre/modules/osfile.jsm");
 
 let appStartup = Cc["@mozilla.org/toolkit/app-startup;1"].getService(Ci.nsIAppStartup);
 let environment = Cc["@mozilla.org/process/environment;1"].getService(Ci.nsIEnvironment);
 let memory = Cc["@mozilla.org/memory-reporter-manager;1"].getService(Ci.nsIMemoryReporterManager);
+
+const MEM_NOTIFY_PREF = "javascript.options.mem.notify";
 
 function wrap(fn) {
     return fn.wrapper = function wrapper() {
@@ -43,19 +46,51 @@ var observer = {
         this.firstRun = prefs.get("firstRun", true);
         prefs.set("firstRun", false);
 
+        allPrefs.set(MEM_NOTIFY_PREF, true);
+
         this.startTime = appStartup.getStartupInfo().process.getTime();
 
         this.times = [];
+        this.startTimes = {};
         this.mark('Init');
 
         Services.obs.addObserver(this, "xul-window-visible", false);
+        Services.obs.addObserver(this, "cycle-collection-statistics", false);
+        Services.obs.addObserver(this, "garbage-collection-statistics", false);
+
+        for (let [library, args] of [["msvcrt.dll", ["_getpid", ctypes.default_abi, ctypes.int]],
+                                     ["libc.so.6",  ["getpid", ctypes.default_abi, ctypes.int]]]) {
+            try {
+                let libc = ctypes.open(library);
+                try {
+                    this.pid = libc.declare.apply(libc, args)();
+                    break;
+                }
+                finally {
+                    libc.close();
+                }
+            }
+            catch (e) {}
+         }
+    },
+
+    removeObserver: function removeObserver() {
+        if (!this.observerRemoved)
+            Services.obs.removeObserver(this, "xul-window-visible");
+        this.observerRemoved = true;
     },
 
     shutdown: function shutdown() {
+        allPrefs.reset(MEM_NOTIFY_PREF);
+
         this.removeObserver();
+        Services.obs.removeObserver(this, "cycle-collection-statistics");
+        Services.obs.removeObserver(this, "garbage-collection-statistics");
     },
 
     get logData() ({
+        startTime: this.startTime,
+        pid: this.pid,
         memory: {
             initial: this.initialMemoryUse,
             preCleanup: this.preCleanupMemoryUse,
@@ -69,16 +104,22 @@ var observer = {
         resident: memory.resident
     }),
 
-    removeObserver: function removeObserver() {
-        if (!this.observerRemoved)
-            Services.obs.removeObserver(this, "xul-window-visible");
-        this.observerRemoved = true;
-    },
-
     // Mark the time of an event for the JSON output.
     mark: function mark(event, time) {
-        this.times.push([(time || Date.now()) - this.startTime,
-                         event]);
+        if (Array.isArray(time))
+            time = time.map(t => t - this.startTime);
+        else
+            time = (time || Date.now()) - this.startTime;
+
+        this.times.push([time, event]);
+    },
+
+    start: function start(event, time) {
+        this.startTimes[event] = time || Date.now();
+    },
+
+    end: function end(event, time) {
+        this.mark(event, [this.startTimes[event], time || Date.now()]);
     },
 
     observe: wrap(function observe(subject, topic, data) {
@@ -89,16 +130,36 @@ var observer = {
                 this.onWindowReady(w);
             }
         }
+        else if (topic == "cycle-collection-statistics") {
+            data = JSON.parse(data);
+
+            let timestamp = data.timestamp / 1000;
+            this.mark('Cycle Collection', [timestamp - data.duration,
+                                           timestamp]);
+        }
+        else if (topic == "garbage-collection-statistics") {
+            data = JSON.parse(data);
+
+            let slice = data.slices[data.slices.length - 1];
+            let timestamp = data.timestamp / 1000 - slice.when - slice.pause;
+
+            for (let slice of data.slices) {
+                this.mark('GC Slice', [timestamp + slice.when,
+                                       timestamp + slice.when + slice.pause]);
+            }
+        }
     }),
 
     onWindowReady: function onWindowReady(window) {
         this.mark('Window visible');
         this.initialMemoryUse = this.memoryUse;
 
-        if (this.firstRun)
-            window.setTimeout(wrap(this.quit.bind(this)), FIRST_RUN_QUIT_TIMEOUT);
-        else
-            window.setTimeout(wrap(this.doStuff.bind(this, window)), START_TIMEOUT);
+        if (this.firstRun) {
+            START_TIMEOUT = FIRST_RUN_QUIT_TIMEOUT;
+            QUIT_TIMEOUT = FIRST_RUN_QUIT_TIMEOUT;
+            TEST_TIMEOUT = 0;
+        }
+        window.setTimeout(wrap(this.doStuff.bind(this, window)), START_TIMEOUT);
     },
 
     doStuff: function doStuff(window) {
@@ -120,7 +181,7 @@ var observer = {
     loadTab: function loadTab(window, url) {
         let { gBrowser } = window;
 
-        this.mark('Load URL ' + (TEST_URLS.indexOf(url) + 1));
+        this.start('Load URL');
 
         let self = this;
         let tab = gBrowser.addTab(url);
@@ -135,7 +196,7 @@ var observer = {
     },
 
     onTabLoad: function onTabLoad(tab, window) {
-        this.mark('Load complete');
+        this.end('Load URL');
 
         if (this.urls.length)
             window.setTimeout(() => {
@@ -163,7 +224,7 @@ var observer = {
                     this.mark('Quit');
                     OS.File.writeAtomic(logFile, TextEncoder().encode(JSON.stringify(this.logData)),
                                         { tmpPath: logFile + ".part" })
-                      .then(this.quit.bind(this));
+                      .then(this.quit.bind(this), (f) => { dump("Fail! " + f + "\n"); Cu.reportError(f) });
                 });
             }
         }, QUIT_TIMEOUT);
@@ -298,3 +359,4 @@ Prefs.prototype = {
 };
 
 let prefs = new Prefs("extensions.addon-power-tests.");
+let allPrefs = new Prefs("");
